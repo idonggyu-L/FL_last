@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# 실험 산출물
+logs/
+dumps/
+jobs/
+save/
+results/
+figs/
+wandb/
+*.log
+*.pt
+*.pth
+*.npz
+*.png
+
+# 데이터셋 (../data 에서 읽음)
+data/
+
+# 공격별 accuracy 출력 디렉터리
+LGA/
+LPA/
+badnet/
+dba/
+
+# 에디터/OS
+.vscode/
+.idea/
+.DS_Store
