@@ -1,0 +1,40 @@
+{
+  "root": ".",
+  "nlast": 10,
+  "keep_ratio": 0.7,
+  "colors": {
+    "LGA": "#D81B60",
+    "LPA": "#00897B",
+    "BadNet": "#F4511E",
+    "DAA": "#5E35B1",
+    "Adaptive": "#1565C0"
+  },
+  "cells": {
+    "cifar10_resnet18": {
+      "title": "CIFAR-10 / ResNet-18",
+      "limits": {"xt": [-10, 0, 10], "yt": [-10000, -100, -10, 0, 10, 100, 10000],
+                 "xl": [-25, 25], "yl": [-20000, 10000]},
+      "legend": false,
+      "attacks": {
+        "LGA":      "dumps/c10_RN_LGA_s*.npz",
+        "LPA":      "dumps/c10_RN_LPA_s*.npz",
+        "BadNet":   "dumps/c10_RN_badnet_s*.npz",
+        "DAA":      "dumps/c10_RN_daa2_s*.npz",
+        "Adaptive": "dumps/c10_RN_adaptive_s*.npz"
+      }
+    },
+    "cifar100_resnet18": {
+      "title": "CIFAR-100 / ResNet-18",
+      "limits": {"xt": [-10, 0, 10, 100], "yt": [-100000, -1000, -10, 0, 10, 1000, 100000],
+                 "xl": [-30, 60], "yl": [-300000, 300000]},
+      "legend": true,
+      "attacks": {
+        "LGA":      "dumps/c100_RN_LGA_s*.npz",
+        "LPA":      "dumps/c100_RN_LPA_s*.npz",
+        "BadNet":   "dumps/c100_RN_badnet_s*.npz",
+        "DAA":      "dumps/c100_RN_daa2_s*.npz",
+        "Adaptive": "dumps/c100_RN_adaptive_s*.npz"
+      }
+    }
+  }
+}

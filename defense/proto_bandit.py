@@ -28,6 +28,7 @@ Prototype-anchor + contextual-bandit defense for federated backdoor attacks.
 
 import os
 import copy
+import os
 
 import numpy as np
 import torch
@@ -49,7 +50,7 @@ ACTION_KEYS = ["flip", "l2_to_center"]   # reward에 없는 detector들(순환 X
 STATE_DIM = 2 + 5 * len(STATE_KEYS)  # global(n, iter_frac) + 5 feat × 4 score = 22
 
 
-def add_weight_noise(w, w_glob, w_locals, noise):
+def add_weight_noise(w, w_glob, w_locals, noise, mode="norm", clip_value=None):
     """weight-space 노이즈(배수구). 노이즈 벡터 norm = noise · median_update_norm.
     per-element std 를 √P 로 정규화해 노이즈 벡터 크기를 update norm 대비로 제어."""
     if not noise or noise <= 0:
@@ -64,7 +65,16 @@ def add_weight_noise(w, w_glob, w_locals, noise):
         for k in fkeys:
             sq += float(torch.sum((wl[k] - w_glob[k]) ** 2))
         norms.append(sq ** 0.5)
-    std = float(noise) * float(np.median(norms)) / (float(P) ** 0.5)
+    if str(mode) == "flame":
+        # FLAME(USENIX'22) 원식: 원소별 std = λ · S,  S = 선별 클라 업데이트 노름의 중앙값.
+        # √P 로 나누지 않으므로 노이즈 벡터 노름이 √P 배 커진다(λ=0.001 기준 업데이트의 ~3배).
+        _S = float(clip_value) if clip_value is not None else float(np.median(norms))
+        std = float(noise) * _S
+    else:
+        std = float(noise) * float(np.median(norms)) / (float(P) ** 0.5)
+    if int(os.environ.get("PB_NOISE_DEBUG", "0")):
+        print("[noise] mode=%s  clip_value=%s  median_norm=%.3f  P=%d  std=%.6f  vec_norm=%.2f"
+              % (mode, clip_value, float(np.median(norms)), P, std, std * (P ** 0.5)))
     for k in fkeys:
         w[k] = w[k] + (torch.randn_like(w[k].float()) * std).to(w[k].dtype)
     return w
@@ -389,14 +399,18 @@ class ProtoBanditDefense:
         return anchor
 
     def _model_stats(self, net):
-        """모델 하나의 (proto_vec, 관계행렬 S, flip-degradation) 반환."""
+        """모델 하나의 (proto_vec, 관계행렬 S, flip-degradation) 반환.
+        flip detector·앵커를 안 쓰면 flip forward를 생략(클라당 forward 2→1회)."""
         fc, labels = _features(net, self.val_loader, self.device, flip=False)
-        ff, _ = _features(net, self.val_loader, self.device, flip=True)
         pc = _prototypes(fc, labels, self.classes)
-        pf = _prototypes(ff, labels, self.classes)
-        rc, rf = _relmat(pc), _relmat(pf)
-        flipdeg = float(np.linalg.norm(rc - rf))
-        return pc.reshape(-1), rc, flipdeg
+        rc = _relmat(pc)
+        need_flip = ("flip" in getattr(self, "rule_dets", []) or self.S_A is not None
+                     or not self.rule_mode)
+        if not need_flip:
+            return pc.reshape(-1), rc, 0.0
+        ff, _ = _features(net, self.val_loader, self.device, flip=True)
+        rf = _relmat(_prototypes(ff, labels, self.classes))
+        return pc.reshape(-1), rc, float(np.linalg.norm(rc - rf))
 
     def _rotdeg(self, net, angle=ROT_ANGLE):
         """회전(angle°) perturbation 시 관계행렬 변동량."""
@@ -478,8 +492,19 @@ class ProtoBanditDefense:
         Ru = R[:, cols]                                           # (n, K(K-1)/2)
         Rz = (Ru - Ru.mean(0)) / (Ru.std(0) + EPS)                # within-round 표준화
         relmat_score = np.linalg.norm(Rz - np.median(Rz, axis=0), axis=1)  # 상삼각 편차의 2-norm
+        # reldist: 같은 프로토타입을 '유클리드 거리'로 관계행렬화 (cos 대신 거리로 유사도 정의).
+        #  ‖p_a−p_b‖² = ‖p_a‖²+‖p_b‖²−2p_a·p_b 로 K×K를 클라마다 O(K²D) 없이 계산.
+        Kp = len(self.classes)
+        Pv = x.reshape(x.shape[0], Kp, -1)                        # (n, K, D) 원본 프로토타입
+        G = Pv @ np.transpose(Pv, (0, 2, 1))                      # (n, K, K) 그람행렬
+        sq = np.einsum('nkk->nk', G)                              # (n, K) ‖p_k‖²
+        Dm = np.sqrt(np.maximum(sq[:, :, None] + sq[:, None, :] - 2.0 * G, 0.0))
+        Du = Dm[:, iu0, iu1]                                      # 상삼각만
+        Dz = (Du - Du.mean(0)) / (Du.std(0) + EPS)
+        reldist_score = np.linalg.norm(Dz - np.median(Dz, axis=0), axis=1)
         out = {
             "relmat": relmat_score,
+            "reldist": reldist_score,
             "l2_to_center": l2c,
             "anchor_dev": np.asarray(anchordev, dtype=np.float64),
             "flip": -np.asarray(flipexcess, dtype=np.float64),     # 악성=낮은 flipexcess → 부호반전
@@ -519,11 +544,13 @@ class ProtoBanditDefense:
         sel = order[lo:hi]
         return sel if len(sel) > 0 else order[:1]
 
-    def _clipped_fedavg(self, sel, w_locals, w_glob, clip_q):
+    def _clipped_fedavg(self, sel, w_locals, w_glob, clip_q, return_clip=False):
         """선택된 업데이트(=w_i-w_glob)를 clip_q×median_norm 으로 잘라 평균. clip_q=None이면 일반 FedAvg."""
         if clip_q is None or len(sel) == 0:
-            return FedAvg([w_locals[i] for i in sel])
-        fkeys = [k for k in w_glob if w_glob[k].dtype.is_floating_point]
+            _r = FedAvg([w_locals[i] for i in sel])
+            return (_r, None) if return_clip else _r
+        fkeys = [k for k in w_glob if w_glob[k].dtype.is_floating_point
+                 and not k.endswith(("running_mean", "running_var"))]
         norms = []
         for i in sel:
             sq = 0.0
@@ -542,7 +569,7 @@ class ProtoBanditDefense:
                 scale = min(1.0, clip_value / (norms[j] + 1e-8))
                 agg += (w_locals[i][k] - w_glob[k]).float() * scale
             new_w[k] = w_glob[k] + (agg / m).to(w_glob[k].dtype)
-        return new_w
+        return (new_w, clip_value) if return_clip else new_w
 
     def _reward(self, sel, action, w_locals, w_glob, baseline):
         """선택집합 -> (클리핑) 집계 -> baseline(FedAvg-all) 대비 advantage."""
@@ -572,7 +599,8 @@ class ProtoBanditDefense:
         return float(reward), cand
 
     # ------------------------------------------------------------------ #
-    def _dump_relmats(self, relmats, n_malicious, pert=None, clean_accs=None, round_idx=None):
+    def _dump_relmats(self, relmats, n_malicious, pert=None, clean_accs=None, round_idx=None,
+                      protos=None):
         """매 라운드 전체 클라 (clean+flip+회전) 관계행렬 + 악성마스크 + 라운드idx 누적 → npz(덮어쓰기).
         clean은 'relmats' 키(하위호환), 나머지는 'pert_<flip|rot45|...>' 키로 저장.
         viz 가 라운드별 표준화/median편차 재계산 후 정상/악성 히트맵 생성."""
@@ -581,10 +609,20 @@ class ProtoBanditDefense:
         nm = int(n_malicious)
         is_mal = np.array([1] * nm + [0] * (n - nm), dtype=np.int64)  # w_locals[:nm]=악성
         if not hasattr(self, "_dump_buf"):
-            self._dump_buf = {"relmats": [], "is_mal": [], "round": [], "clean_acc": []}
+            self._dump_buf = {"relmats": [], "is_mal": [], "round": [], "clean_acc": [],
+                              "protos": [], "cid": [], "dw": [], "dR": []}
             self._dump_pert = {}
             self._dump_ctr = 0
         self._dump_buf["relmats"].append(R)
+        for _k in ("dw", "dR"):                                   # 파라미터/표현 이동량 (연결 진단)
+            _v = getattr(self, "_dump_%s" % _k, None)
+            self._dump_buf[_k].append(np.asarray(_v, dtype=np.float32) if _v is not None
+                                      else np.full(n, np.nan, dtype=np.float32))
+        _ids = getattr(self.args, "_round_client_ids", None)      # 이번 라운드 클라 id (정체 혼입 검증용)
+        self._dump_buf["cid"].append(np.asarray(_ids, dtype=np.int64) if _ids is not None
+                                     else np.full(n, -1, dtype=np.int64))
+        if protos is not None:                                    # 원본 프로토타입(K*D)
+            self._dump_buf["protos"].append(np.asarray(protos, dtype=np.float32))
         self._dump_buf["is_mal"].append(is_mal)
         actual_round = int(round_idx if round_idx is not None else self._dump_ctr + 1)
         self._dump_buf["round"].append(np.full(n, actual_round, dtype=np.int64))
@@ -607,6 +645,13 @@ class ProtoBanditDefense:
             save["pert_" + k] = np.concatenate(v, 0)
         if self._dump_buf["clean_acc"]:
             save["clean_acc"] = np.concatenate(self._dump_buf["clean_acc"], 0)
+        if self._dump_buf["protos"]:
+            save["protos"] = np.concatenate(self._dump_buf["protos"], 0)
+        if self._dump_buf["cid"]:
+            save["cid"] = np.concatenate(self._dump_buf["cid"], 0)
+        for _k in ("dw", "dR"):
+            if self._dump_buf[_k]:
+                save[_k] = np.concatenate(self._dump_buf[_k], 0)
         np.savez(self.args.pb_dump_relmat, **save)
 
     def observe(self, w_locals, n_malicious=0, round_idx=None):
@@ -655,7 +700,8 @@ class ProtoBanditDefense:
         term_map = {}
         for d in dets:
             z = _z(scores_by_type[d])
-            is_aug = (d != "relmat" and d != "anchor_dev")
+            is_aug = d not in ("relmat", "reldist", "ratio", "axsum", "maha",
+                               "maha_a", "maha_b", "anchor_dev")
             if is_aug and aug_tails:
                 term_map[d + "+"] = np.maximum(z, 0.0)
                 term_map[d + "-"] = np.maximum(-z, 0.0)
@@ -681,18 +727,40 @@ class ProtoBanditDefense:
             combined = sum(w * t for w, t in zip(ws, terms))
         else:
             combined = sum(terms)  # 균등 z합 (기존)
-        order = np.argsort(combined)                       # 낮은(신뢰) 순
-        n = len(order)
-        lo = int(getattr(self.args, "pb_rule_drop", 0.0) * n)   # 도넛: 최상위 신뢰 버림
-        # warmup: 초반 라운드는 더 깊게 잘라 탐지 lock-on 유도(양성 피드백의 좋은 basin 진입)
-        _keep = float(getattr(self.args, "pb_rule_keep", 0.5))
-        _wr = int(getattr(self.args, "pb_warmup_rounds", 0))
-        if _wr > 0 and int(getattr(self.args, "iter", 0)) < _wr:
-            _keep = float(getattr(self.args, "pb_warmup_keep", 0.3))
-        hi = max(lo + 1, int(_keep * n))
-        sel = order[lo:hi]                                 # band-pass
-        cand = self._clipped_fedavg(sel, w_locals, w_glob, None)
-        cand = add_weight_noise(cand, w_glob, w_locals, self.noise)
+        n = len(combined)
+        # 결합 방식: sum=z 합산 후 밴드(기존) / inter=detector별 밴드의 교집합.
+        #  합산은 한 detector가 강해도 다른 detector가 반대로 흔들리면 상쇄된다.
+        #  교집합은 "모든 detector가 신뢰한 클라"만 남겨 상쇄를 피한다.
+        if str(getattr(self.args, "pb_combine", "sum")) == "inter" and len(terms) > 1:
+            _dr = float(getattr(self.args, "pb_rule_drop", 0.0))
+            _kp = float(getattr(self.args, "pb_rule_keep", 0.5))
+            _sets = []
+            for t in terms:
+                _o = np.argsort(t); _lo = int(_dr * n); _hi = max(_lo + 1, int(_kp * n))
+                _sets.append(set(_o[_lo:_hi].tolist()))
+            _inter = set.intersection(*_sets)
+            if not _inter:                                  # 공집합이면 합산 순위 최상위 1명
+                _inter = {int(np.argsort(combined)[0])}
+            sel = np.array(sorted(_inter), dtype=int)
+            order = np.argsort(combined)                    # 로그용 순위는 합산 기준 유지
+            lo, hi = 0, len(sel)
+        else:
+            order = np.argsort(combined)                    # 낮은(신뢰) 순
+            lo = int(getattr(self.args, "pb_rule_drop", 0.0) * n)   # 도넛: 최상위 신뢰 버림
+            # warmup: 초반은 더 깊게 잘라 탐지 lock-on 유도(양성 피드백의 좋은 basin 진입)
+            _keep = float(getattr(self.args, "pb_rule_keep", 0.5))
+            _wr = int(getattr(self.args, "pb_warmup_rounds", 0))
+            if _wr > 0 and int(getattr(self.args, "iter", 0)) < _wr:
+                _keep = float(getattr(self.args, "pb_warmup_keep", 0.3))
+            hi = max(lo + 1, int(_keep * n))
+            sel = order[lo:hi]                             # band-pass
+        # 노이즈-클리핑 결합(FLAME/CRFL): 업데이트를 clip_q×median_norm 으로 자른 뒤 같은 스케일의
+        # 노이즈를 부어야 "노이즈가 잔여 악성 기여를 지배한다"는 논증이 성립. 0/미지정이면 클리핑 없음.
+        _cq = float(getattr(self.args, "pb_clip_q", 0.0) or 0.0)
+        cand, _cv = self._clipped_fedavg(sel, w_locals, w_glob,
+                                         (_cq if _cq > 0 else None), return_clip=True)
+        cand = add_weight_noise(cand, w_glob, w_locals, self.noise,
+                                mode=getattr(self.args, "pb_noise_mode", "norm"), clip_value=_cv)
         sel_set = set(int(i) for i in sel)
         mal_kept = sum(1 for i in range(n_malicious) if i in sel_set)
         # 악성의 combined 순위(0=가장 신뢰, n-1=가장 의심). 탐지력 추적용.
@@ -711,6 +779,8 @@ class ProtoBanditDefense:
         need_rot = self.rule_mode and len(self.rot_dets) > 0
         need_aug = self.rule_mode and len(self.aug_dets) > 0
         dump_on = bool(getattr(self.args, "pb_dump_relmat", ""))
+        # 경량 덤프: 프로토타입만 저장(이미 계산됨) → perturbation 11회 + accuracy 1회 forward 생략
+        dump_light = dump_on and bool(getattr(self.args, "pb_dump_light", 0))
         # 1) 각 client 모델 통계
         proto_vecs, anchordev, flipexcess, relmats = [], [], [], []
         rotexcess = {d: [] for d in self.rot_dets}    # detector별 회전 변동 초과량
@@ -718,8 +788,8 @@ class ProtoBanditDefense:
         rot_mats = {d: [] for d in self.rot_dets}     # perturb_peer: 클라별 회전 관계행렬
         aug_mats = {d: [] for d in self.aug_dets}     # perturb_peer: 클라별 aug 관계행렬
         augdeg = {d: [] for d in self.aug_dets}       # detector별 일반aug 변동량(invert 등)
-        pert_buf = [] if dump_on else None       # 덤프 시 clean+flip+회전 relmat 수집
-        clean_accs = [] if dump_on else None     # 덤프 시 클라별 clean accuracy(공격자 가정 검증)
+        pert_buf = [] if (dump_on and not dump_light) else None       # 덤프 시 clean+flip+회전 relmat 수집
+        clean_accs = [] if (dump_on and not dump_light) else None     # 덤프 시 클라별 clean accuracy(공격자 가정 검증)
         for w in w_locals:
             pv, rel, fd = self._stats_from_weights(w)   # w를 self.template에 로드
             proto_vecs.append(pv)
@@ -740,7 +810,7 @@ class ProtoBanditDefense:
                         aug_mats[d].append(self._aug_relmat_flat(self.template, self.aug_specs[d]))
                     else:                                # 자기차이: 변동량
                         augdeg[d].append(self._augdeg(self.template, self.aug_specs[d]))
-            if dump_on:                                  # 로드된 self.template 재사용
+            if dump_on and not dump_light:               # 로드된 self.template 재사용
                 pert_buf.append(self._perturb_relmats(self.template))
                 # 공격자 가정 검증: 악성도 clean 정확도는 정상과 같은가?
                 clean_accs.append(float(_accuracy(self.template, self.val_loader, self.device)))
@@ -767,6 +837,61 @@ class ProtoBanditDefense:
                 _ref = np.median(_U, axis=0)
                 _ref = _ref / (np.linalg.norm(_ref) + EPS)
                 scores_by_type["ddir"] = -(_U @ _ref)      # 또래 평균방향과 어긋날수록 의심
+        # ratio: 표현 이탈 ‖F_i‖ 을 파라미터 이동 ‖Δw_i‖ 로 나눈 '기하 왜곡 효율'.
+        #  데이터 이질성은 분자·분모를 같이 키워 약분되고, 공격 성격만 남는다.
+        #   LGA  = 적게 움직이고 많이 틀어짐            → 비율 높음  ↑
+        #   LPA  = 보통 움직이고 틀어짐                 → 비율 높음  ↑
+        #   BadNet = 많이 움직이고 clean 기하는 그대로   → 비율 낮음  ↓
+        #  양쪽 꼬리를 모두 잡아야 하므로 중앙값으로부터의 |log 편차|.
+        if "ratio" in self.rule_dets:
+            _rk = [k for k in w_glob if w_glob[k].dtype.is_floating_point
+                   and not k.endswith(("running_mean", "running_var"))]
+            _dw = np.asarray([float(sum(float(torch.sum((_w[k].float() - w_glob[k].float()) ** 2))
+                                        for k in _rk) ** 0.5) for _w in w_locals], dtype=np.float64)
+            _fn = np.asarray(scores_by_type["relmat"], dtype=np.float64)   # ‖F_i‖ = 또래 이탈
+            _lr = np.log((_fn + EPS) / (_dw + EPS))
+            scores_by_type["ratio"] = np.abs(_lr - np.median(_lr))
+        # axsum: 표현 축과 파라미터 축을 각각 '양방향'으로 만든 뒤 합산.
+        #   a = log‖F_i‖ (또래 기하 이탈)   b = log‖Δw_i‖ (파라미터 이동)
+        #   score = |z(a)| + |z(b)| + |z(a−b)|
+        #  뺄셈 하나(비율)로 접으면 '둘 다 큼'이 상쇄돼 보이지 않는다. 세 방향을 |z|로 두면
+        #  부호가 통일돼 증거가 상쇄 대신 누적된다.
+        #   LGA=b 매우 작음 / BadNet=b 큼 / LPA=b 흔적 없고 a 만 큼 → 세 공격이 서로 다른 축에 걸림
+        if "axsum" in self.rule_dets:
+            _ak = [k for k in w_glob if w_glob[k].dtype.is_floating_point
+                   and not k.endswith(("running_mean", "running_var"))]
+            _b = np.log(np.asarray([float(sum(float(torch.sum((_w[k].float() - w_glob[k].float()) ** 2))
+                                              for k in _ak) ** 0.5) for _w in w_locals], dtype=np.float64) + EPS)
+            _a = np.log(np.asarray(scores_by_type["relmat"], dtype=np.float64) + EPS)
+            def _rzs(v):
+                m = np.median(v)
+                return (v - m) / (1.4826 * np.median(np.abs(v - m)) + EPS)
+            scores_by_type["axsum"] = (np.abs(_rzs(_a)) + np.abs(_rzs(_b)) + np.abs(_rzs(_a - _b)))
+        # maha: (표현 이탈, 파라미터 이동) 평면에서 또래 분포에 대한 마할라노비스 거리.
+        #   x_i = (log‖F_i‖, log‖Δw_i‖).  세 공격이 평면의 서로 다른 방향에 놓이므로
+        #   한 방향만 보는 스칼라(비율=뺄셈 등)는 반드시 하나를 놓친다. 마할라노비스는 전 방향을 덮는다.
+        #   공분산은 가장 먼 2개를 빼고 추정 → 악성이 자기 방향 분산을 부풀리는 마스킹 차단.
+        #   maha_a / maha_b 는 축 단독 ablation. 2D와 완전히 같은 중심화(median)·스케일(std)을
+        #   쓰고 공분산 결합만 뺀 것이라, 차이가 곧 '두 축을 함께 보는 것'의 순수 기여분이다.
+        if any(d in self.rule_dets for d in ("maha", "maha_a", "maha_b")):
+            _hk = [k for k in w_glob if w_glob[k].dtype.is_floating_point
+                   and not k.endswith(("running_mean", "running_var"))]
+            _hb = np.log(np.asarray([float(sum(float(torch.sum((_w[k].float() - w_glob[k].float()) ** 2))
+                                               for k in _hk) ** 0.5) for _w in w_locals], dtype=np.float64) + EPS)
+            _ha = np.log(np.asarray(scores_by_type["relmat"], dtype=np.float64) + EPS)
+            _X = np.stack([_ha, _hb], 1)
+            _U = _X - np.median(_X, axis=0)
+            if "maha_a" in self.rule_dets:                          # 표현 축 단독
+                scores_by_type["maha_a"] = np.abs(_U[:, 0]) / (_U[:, 0].std() + EPS)
+            if "maha_b" in self.rule_dets:                          # 파라미터 축 단독
+                scores_by_type["maha_b"] = np.abs(_U[:, 1]) / (_U[:, 1].std() + EPS)
+            if "maha" in self.rule_dets:
+                _d0 = np.linalg.norm(_U / (_U.std(0) + EPS), axis=1)
+                _kp = np.argsort(_d0)[:max(3, len(_ha) - 2)]        # trim 2
+                _S = np.cov(_U[_kp].T)
+                _S = _S + np.eye(2) * 1e-6 * max(float(np.trace(_S)), EPS)
+                scores_by_type["maha"] = np.sqrt(np.maximum(
+                    np.einsum("ij,jk,ik->i", _U, np.linalg.inv(_S), _U), 0.0))
         # unorm: 업데이트 크기(‖w_i − w_glob‖). LGA는 은닉하려 업데이트를 깎아 비정상적으로 작아짐.
         # 부호는 "작을수록 의심"이라 −norm 을 점수로(다른 detector와 방향 통일).
         if "unorm" in self.rule_dets:
@@ -790,10 +915,26 @@ class ProtoBanditDefense:
             for d in self.aug_dets:
                 scores_by_type[d] = (self._peer_score(aug_mats[d]) if self.perturb_peer
                                      else np.asarray(augdeg[d], dtype=np.float64))
+        if dump_on:
+            # 연결 진단: 파라미터 이동량 ‖Δw‖ 와 표현 이동량 ‖R_i − R_glob‖.
+            #  비율 ‖ΔR‖/‖Δw‖ 는 데이터 이질성(둘 다 키움)이 약분되고 공격 성격만 남는다.
+            #  LGA=적게 움직이고 많이 틀어짐(높음) / BadNet=많이 움직이고 안 틀어짐(낮음)
+            _fk = [k for k in w_glob if w_glob[k].dtype.is_floating_point
+                   and not k.endswith(("running_mean", "running_var"))]
+            self._dump_dw = [float(sum(float(torch.sum((wl[k].float() - w_glob[k].float()) ** 2))
+                                       for k in _fk) ** 0.5) for wl in w_locals]
+            self.template.load_state_dict(w_glob); self.template.to(self.device)
+            _fg, _lg = _features(self.template, self.val_loader, self.device)
+            _Rg = _relmat(_prototypes(_fg, _lg, self.classes)).reshape(-1)
+            _Kc = int(round(np.sqrt(len(_Rg)))); _i0, _i1 = np.triu_indices(_Kc, k=1)
+            _cl = _i0 * _Kc + _i1
+            self._dump_dR = [float(np.linalg.norm(np.asarray(r, dtype=np.float64)[_cl] - _Rg[_cl]))
+                             for r in relmats]
         # (진단) relmat 덤프: 매 라운드 전체 클라 (clean+flip+회전) 관계행렬 + 악성마스크 누적 저장
         if dump_on:
             self._dump_relmats(relmats, n_malicious, pert_buf, clean_accs,
-                               round_idx=int(getattr(self.args, "iter", 0)) + 1)
+                               round_idx=int(getattr(self.args, "iter", 0)) + 1,
+                               protos=(proto_vecs if getattr(self.args, "pb_dump_protos", 0) else None))
         if self.rule_mode:
             return self._rule_aggregate(scores_by_type, w_locals, w_glob, n_malicious)
         state = self._build_state(scores_by_type, len(w_locals))

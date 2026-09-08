@@ -19,7 +19,7 @@ from utils.info import print_exp_details, write_info_to_accfile, get_base_info
 from defense.multimetric import Multi_metrics
 from defense.proto_bandit import ProtoBanditDefense, fedavg_noise
 from utils.options import args_parser
-from utils.sampling import cifar_iid, cifar_noniid, cifar_iid_fl, cifar_noniid_fl
+from utils.sampling import cifar_iid, cifar_noniid, cifar_iid_fl, cifar_noniid_fl, dirichlet_partition
 
 
 from client.Attacker import attacker
@@ -149,8 +149,6 @@ def test_mkdir(path):
 if __name__ == '__main__':
     # parse args
     args = args_parser()
-    os.makedirs('./' + args.save, exist_ok=True)    # 로그/트리거 이미지 출력
-    os.makedirs('./' + args.attack, exist_ok=True)  # 공격별 accuracy 파일 출력
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -244,12 +242,12 @@ if __name__ == '__main__':
         probe_dataset = datasets.CIFAR100('../data/cifar100',
                                           train=True, download=True, transform=valid_transform)
         if args.iid:
-            if args.defence == 'fltrust':
+            if args.defence in ('fltrust', 'flare'):
                 dict_users, central_dataset = cifar_iid_fl(dataset_train, args.num_users, 100, args.p, args)
             else:
                 dict_users = cifar_iid(dataset_train, args.num_users)
         else:
-            if args.defence == 'fltrust' :
+            if args.defence in ('fltrust', 'flare'):
                 dict_users_pre, central_dataset = cifar_noniid_fl(dataset_train, args.num_users, 100, args.p, args)
             else:
                 dict_users_pre = cifar_noniid_fl(dataset_train, args.num_users, 100, args.p, args)
@@ -275,6 +273,35 @@ if __name__ == '__main__':
     else:
         exit('Error: unrecognized model')
 
+
+    # 분할 방식: dirichlet 이면 위에서 만든 결정적 분할을 덮어쓴다(라벨 skew만, 수량 균등).
+    if str(getattr(args, 'partition', 'group')) == 'dirichlet':
+        _dnc = 100 if args.dataset == 'cifar100' else 10
+        _dex = (central_dataset if (args.defence in ('fltrust', 'flare')
+                                    and 'central_dataset' in dir() and central_dataset) else None)
+        dict_users = dirichlet_partition(list(dataset_train.targets), args.num_users,
+                                         _dnc, args.p, seed=getattr(args, 'seed', 1), exclude=_dex)
+        if _dex:
+            print('[main] Dirichlet: 서버 root %d장을 클라 풀에서 제외' % len(_dex))
+        _lab = np.asarray(dataset_train.targets)
+        _mx = [np.bincount(_lab[np.asarray(sorted(v))], minlength=_dnc).max() / len(v)
+               for v in dict_users.values()]
+        print('[main] Dirichlet 분할 q=%.2f: 클라당 %d장, 최대 클래스 비중 평균 %.3f (min %.3f / max %.3f)'
+              % (args.p, len(next(iter(dict_users.values()))), np.mean(_mx), np.min(_mx), np.max(_mx)))
+
+    # 클라별 데이터 양 이질성. 기본 분할은 전원 정확히 같은 표본 수라 SGD 스텝 수가 동일해지고,
+    # 그 결과 정상 클라의 ‖Δw‖ 산포가 CV 0.001 수준으로 붕괴한다(파라미터 축 탐지가 세팅 인공물이 됨).
+    # var>0 이면 각 클라가 자기 샤드의 (1-var, 1] 비율만 사용 → 스텝 수가 달라져 현실적 산포가 생긴다.
+    _csv = float(getattr(args, 'client_size_var', 0.0))
+    if _csv > 0:
+        _crng = np.random.RandomState(int(getattr(args, 'seed', 1)) + 4242)
+        for _k in list(dict_users.keys()):
+            _idx = np.asarray(sorted(dict_users[_k]), dtype=np.int64)
+            _n = max(20, int(len(_idx) * (1.0 - _csv * _crng.rand())))
+            dict_users[_k] = set(int(i) for i in _crng.choice(_idx, min(_n, len(_idx)), replace=False))
+        _sz = sorted(len(v) for v in dict_users.values())
+        print('[main] client_size_var=%.2f → 표본 수 min %d / 중앙 %d / max %d'
+              % (_csv, _sz[0], _sz[len(_sz)//2], _sz[-1]))
 
     # defense init
     multi_metric = Multi_metrics(10, 1, args)
@@ -392,9 +419,22 @@ if __name__ == '__main__':
     backdoor_acculist = [0]  # BSR list
 
 
-    malicious_list = []  # list of the index of malicious clients
-    for i in range(int(args.num_users * args.malicious)):
-        malicious_list.append(i)
+    # 악성 풀. 기본(block)은 0..n-1 인데, 이 코드의 non-IID 분할은 dict_users[group*10+j] 라
+    # 클라 번호가 데이터 분포를 결정한다 → block 이면 악성 전원이 같은 그룹(=같은 편중 클래스)이 되어
+    # "공격 전부터 분포가 다르고 또래가 없는" 교란이 생긴다. spread 는 그룹마다 1명씩 뽑아
+    # 악성/정상의 데이터 분포를 동일하게 맞춘다(탐지되면 오직 공격 때문).
+    _n_mal = int(args.num_users * args.malicious)
+    malicious_list = []
+    if str(getattr(args, 'mal_pool', 'block')) == 'spread':
+        # 클라 번호 공간에 균등 배치. cifar10(그룹당 10명)이면 그룹마다 정확히 1명 →
+        # 악성/정상 분포가 동일해진다. cifar100(그룹당 1명)이면 편중 클래스가 흩어진다.
+        _step = max(1, int(args.num_users) // max(_n_mal, 1))
+        for i in range(_n_mal):
+            malicious_list.append((i * _step) % int(args.num_users))
+    else:
+        for i in range(_n_mal):
+            malicious_list.append(i)
+    print('[main] malicious pool (%s): %s' % (getattr(args, 'mal_pool', 'block'), malicious_list))
 
     if args.all_clients:
         print("Aggregation over all clients")
@@ -416,6 +456,7 @@ if __name__ == '__main__':
         n_mal_this_round = attack_number  # 진단용: w_locals 앞쪽 n개가 악성(주입 순서)
         idxs_users = sample_round_users(
             args.num_users, m, malicious_list, n_mal_this_round)
+        args._round_client_ids = [int(i) for i in idxs_users]   # 덤프용: 클라 정체 기록
 
         mal_weight=[]
         mal_loss=[]

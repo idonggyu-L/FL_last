@@ -26,6 +26,9 @@ def args_parser():
                         default='ours', help='attack method')
     parser.add_argument('--ada_mode', type=int,
                         default=1, help='adaptive attack mode')
+    parser.add_argument('--ada_assume', type=str, default='',
+                        choices=['', 'krum', 'multikrum', 'flame'],
+                        help="adaptive 공격자가 상정하는 방어(실제 방어와 분리). ''=기존 동작")
     parser.add_argument('--poison_frac', type=float, default=1,
                         help="fraction of dataset to corrupt for backdoor attack, 1.0 for layer attack")
 
@@ -66,6 +69,12 @@ def args_parser():
                         help='whether i.i.d or not')
 
  #************************atttack_label********************************#
+    parser.add_argument('--partition', type=str, default='group', choices=['group','dirichlet'],
+                        help="클라 분할: group=결정적 지배클래스 q(기존) / dirichlet=p_i~Dir(q), q 작을수록 강한 skew")
+    parser.add_argument('--client_size_var', type=float, default=0.0,
+                        help='클라별 표본 수 이질성. 각 클라가 샤드의 (1-var,1] 비율만 사용. 0=균등(기존)')
+    parser.add_argument('--mal_pool', type=str, default='block', choices=['block','spread'],
+                        help="악성 클라 선정: block=0..n-1(기본, 전원 같은 데이터 그룹) / spread=그룹마다 1명(분포 교란 제거)")
     parser.add_argument('--attack_label', type=int, default=5,
                         help="trigger for which label")
     
@@ -149,6 +158,16 @@ def args_parser():
                         help="불균형 probe의 클래스별 표본수 배치를 섞는 seed")
     parser.add_argument('--pb_dump_relmat', type=str, default='',
                         help="지정 시 매 라운드 전체 클라 관계행렬+악성마스크를 이 npz에 누적 저장(시각화용)")
+    parser.add_argument('--pb_combine', type=str, default='sum', choices=['sum','inter'],
+                        help="detector 결합: sum=z합산 후 밴드 / inter=detector별 밴드의 교집합(상쇄 회피)")
+    parser.add_argument('--pb_noise_mode', type=str, default='norm', choices=['norm','flame'],
+                        help="노이즈 스케일: norm=λ·median‖Δw‖/√P(기존) / flame=λ·S 원소별(FLAME 원식)")
+    parser.add_argument('--pb_clip_q', type=float, default=0.0,
+                        help='>0이면 선택된 업데이트를 clip_q×median_norm 으로 클리핑 후 집계(노이즈와 결합). 0=클리핑 없음')
+    parser.add_argument('--pb_dump_light', type=int, default=0,
+                        help='1이면 덤프 시 프로토타입만 저장하고 perturbation(11 forward)·accuracy 계산 생략')
+    parser.add_argument('--pb_dump_protos', type=int, default=0,
+                        help='1이면 덤프에 원본 프로토타입(K*D)도 저장 → cos/유클리드 등 임의 관계행렬 오프라인 재계산')
     parser.add_argument('--pb_dump_every', type=int, default=1,
                         help="관계행렬 dump 저장 주기(라운드 수; 메모리에는 매 라운드 누적)")
     parser.add_argument('--pb_observe', type=int, default=0,

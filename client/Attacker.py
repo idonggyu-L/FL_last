@@ -177,16 +177,23 @@ def get_key_value_bsr(model_param, args, mal_train_dataset, mal_val_dataset):
     return key_arr, value_arr, back_acc
 
 
+def _ada_assumed(args):
+    """공격자가 '상정'하는 방어. 비어 있으면 기존 동작(실제 방어와 동일)을 유지.
+    실제 방어(args.defence)와 분리해야 우리 방어를 쓰면서 FLAME/Krum 상정 공격을 평가할 수 있다."""
+    return getattr(args, 'ada_assume', '') or args.defence
+
+
 def adaptive_attack_analysis(benign_model_weight_list, malicious_model_weight, global_model, args, num_mal=1):
     # if malicious client is selected return True
     malicious_model_weight_list = [malicious_model_weight for i in range(num_mal)]
-    if args.defence == 'flame':
+    _asm = _ada_assumed(args)
+    if _asm == 'flame':
         res = adaptive_attack_analysis_flame(benign_model_weight_list, malicious_model_weight_list, args)
         if len(res) == 0:
             return False
         else:
             return True
-    if args.defence == 'krum' or args.defence == 'multikrum' or args.defence == 'fltrust' or args.defence == 'avg' or args.defence == 'fld' or args.defence == 'RLR' or args.defence != None:
+    if _asm is not None:
         benign_update_list = []
         for i in range(len(benign_model_weight_list)):
             benign_update_list.append(get_update(benign_model_weight_list[i], copy.deepcopy(global_model.state_dict())))
@@ -221,9 +228,11 @@ def adaptive_attack_analysis_krum(benign_update_list, malicious_update, k, args)
     if args.log_distance == True:
         log_dis = True
         args.log_distance = False
-    if args.defence == 'krum'  or args.defence == 'fltrust' or args.defence == 'avg' or args.defence == 'fld' or args.defence=='RLR':
+    # 상정 방어가 'krum'이면 단일 Krum, 그 외(기본 multikrum 포함)는 Multi-Krum.
+    # 기존 동작(defence=protobandit → multi_k=True)과 동일하게 유지된다.
+    if _ada_assumed(args) == 'krum':
         selected_client = multi_krum(malicious_update, k, args)
-    elif args.defence == 'multikrum' or args.defence != 'multikrum':
+    else:
         selected_client = multi_krum(malicious_update, k, args, multi_k=True)
     print(selected_client)
     if log_dis == True:
@@ -435,9 +444,14 @@ def attacker(list_mal_client, num_mal, attack_type, dataset_train, dataset_test,
     if attack_type == "dba":
         args.dba_sign += 1
         print(idx,args.dba_sign,'dba attack')
-    # DBA: 조각(dba_class)을 '라운드 내 악성 위치'로 배정해야 4조각이 매 라운드 모두 커버됨.
-    # order=글로벌idx%4 면 랜덤샘플링 탓에 커버리지 깨져 공격 무력화됨 → dba_pos(num_turn) 사용.
-    _order = dba_pos if (attack_type == "dba" and dba_pos is not None) else idx
+    # DBA: dba_class = order % 4 로 4조각 중 하나를 심는다.
+    # 라운드당 악성이 1명(malicious=0.1, m=10)뿐이고 sample_round_users 가 악성을 항상 맨 앞에
+    # 두므로 num_turn 은 늘 0 → 조각 0만 300라운드 내내 심겨 평가용 4조각 트리거와 안 맞았다.
+    # 라운드 번호로 조각을 회전시켜 4조각을 모두 심는다(악성이 여럿이면 위치를 더해 분산).
+    if attack_type == "dba":
+        _order = int(getattr(args, 'iter', 0)) + int(dba_pos or 0)
+    else:
+        _order = idx
     local = LocalMaliciousUpdate(args=args, dataset=dataset_train, idxs=dict_users[idx], order=_order, dataset_test=dataset_test,
                                  prev_update=prev_update,edge=edge)
     if attack_type == "layerattack_ER_his" or attack_type == "LFA" or attack_type == "LPA":

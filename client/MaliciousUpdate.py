@@ -298,7 +298,8 @@ class LocalMaliciousUpdate(object):
         attack_param = {}
         attack_list = get_attack_layers_no_acc(copy.deepcopy(net.state_dict()), self.args)
         
-        for layer in self.args.attack_layers:
+        # 이전 라운드의 공격 층을 누적(LFA 원설계). 첫 라운드엔 args.attack_layers 가 None.
+        for layer in (self.args.attack_layers or []):
             if layer not in attack_list:
                 attack_list.append(layer)
         print(attack_list)
@@ -696,4 +697,4 @@ def load_saved_dataset(filename, batch_size=64):
         data_dict = pickle.load(f)
     dataset = CustomDataset(data_dict)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=('train' in filename))
-    return dataset, loader
+    return dataset, loader

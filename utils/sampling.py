@@ -358,3 +358,35 @@ if __name__ == '__main__':
                                    ]))
     num = 100
     d = mnist_noniid(dataset_train, num)
+
+
+def dirichlet_partition(dataset_label, num_clients, num_classes, q, seed=1, exclude=None):
+    """클라마다 p_i ~ Dir(q·1_K) 로 클래스 비율을 뽑고 그 비율대로 표본 배정.
+    표본 수는 클라마다 동일(N/num_clients) → 수량은 균등, 라벨만 치우침.
+    q 가 작을수록 특정 클래스에 몰림(표준 Dirichlet 농도 관례)."""
+    rng = np.random.RandomState(int(seed))
+    labels = np.asarray(dataset_label)
+    _ex = set() if exclude is None else set(int(i) for i in exclude)   # fltrust/flare 서버 root 제외
+    pool = [rng.permutation([i for i in np.where(labels == c)[0] if int(i) not in _ex]).tolist()
+            for c in range(num_classes)]
+    n_per = (len(labels) - len(_ex)) // num_clients
+    dict_users = {}
+    for i in range(num_clients):
+        p = rng.dirichlet([float(q)] * num_classes)
+        cnt = rng.multinomial(n_per, p)
+        picked = []
+        for c in range(num_classes):
+            take = int(min(cnt[c], len(pool[c])))
+            if take:
+                picked += pool[c][:take]
+                pool[c] = pool[c][take:]
+        short = n_per - len(picked)                       # 소진된 클래스 몫은 남은 풀에서 보충
+        avail = [c for c in range(num_classes) if pool[c]]
+        while short > 0 and avail:
+            c = avail[rng.randint(len(avail))]
+            picked.append(pool[c].pop())
+            if not pool[c]:
+                avail.remove(c)
+            short -= 1
+        dict_users[i] = set(int(x) for x in picked)
+    return dict_users
